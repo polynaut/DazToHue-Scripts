@@ -1,0 +1,585 @@
+// DAZ Studio version 4.22.0.16 filetype DAZ Script
+
+// Complete DAZ Studio Licensing Report Generator
+// Analyzes scene assets and matches them to installed DIM products, then
+// writes a licensing report next to this script.
+//
+// Part of DazToHue-Scripts. Shared helpers come from ../DthUtils.dsa
+// (verbose / DTH_VERBOSE / getSceneNameNoExt); the scene-asset and
+// installed-product listers are siblings in this products/ folder.
+
+var dir_self = new DzDir(new DzFileInfo(getScriptFileName()).path());
+var dir_root = new DzDir(dir_self.path());
+dir_root.cdUp();   // products/ -> repo root, where DthUtils.dsa lives
+if (typeof verbose !== "function")
+  include(dir_root.filePath("DthUtils.dsa"));
+include(dir_self.filePath("getInstalledProducts.dsa"));
+include(dir_self.filePath("getUsedAssets.dsa"));
+
+// Detect the Genesis version used in the scene
+function detectSceneGenesisVersion(usedAssets) {
+  for (var i = 0; i < usedAssets.length; i++) {
+    var name = usedAssets[i].name.toLowerCase();
+    var techName = usedAssets[i].technicalName.toLowerCase();
+
+    if (name.indexOf("genesis 9") !== -1 || techName.indexOf("genesis9") !== -1) {
+      return 9;
+    }
+    if (name.indexOf("genesis 8.1") !== -1 || techName.indexOf("genesis8_1") !== -1) {
+      return 8.1;
+    }
+    if (name.indexOf("genesis 8") !== -1 || techName.indexOf("genesis8") !== -1) {
+      return 8;
+    }
+  }
+  return 0; // Unknown
+}
+
+// Check if a product name matches a specific Genesis version
+function productMatchesGenesisVersion(productName, version) {
+  var name = productName.toLowerCase();
+  if (version === 9) {
+    return name.indexOf("genesis 9") !== -1 || name.indexOf("g9") !== -1;
+  }
+  if (version === 8.1 || version === 8) {
+    return name.indexOf("genesis 8") !== -1 || name.indexOf("g8") !== -1;
+  }
+  return false;
+}
+
+// Check if a product is for a DIFFERENT Genesis version (mismatch)
+function productIsWrongGenesisVersion(productName, sceneVersion) {
+  var name = productName.toLowerCase();
+  if (sceneVersion === 9) {
+    // If scene is G9, reject products explicitly for G3, G8 (but not G8.1 since some work)
+    if ((name.indexOf("genesis 3") !== -1 || name.indexOf(" g3 ") !== -1) &&
+        name.indexOf("genesis 9") === -1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findProductMatches(usedAssets, installedProducts) {
+  var matches = [];
+  var unmatched = [];
+
+  // Detect scene Genesis version
+  var sceneGenesisVersion = detectSceneGenesisVersion(usedAssets);
+  print("Detected scene Genesis version: " + (sceneGenesisVersion || "Unknown"));
+
+  // Create multiple lookup maps for different matching strategies
+  var productNameMap = {};
+  var productKeywordMap = {};
+  var productSkuMap = {};
+
+  // Build lookup maps
+  for (var i = 0; i < installedProducts.length; i++) {
+    var product = installedProducts[i];
+    var name = product.name.toLowerCase();
+
+    // Direct name mapping
+    productNameMap[name] = product;
+
+    // SKU mapping
+    productSkuMap[product.sku] = product;
+
+    // Keyword extraction for fuzzy matching
+    var keywords = extractKeywords(name);
+    for (var k = 0; k < keywords.length; k++) {
+      if (!productKeywordMap[keywords[k]]) {
+        productKeywordMap[keywords[k]] = [];
+      }
+      productKeywordMap[keywords[k]].push(product);
+    }
+  }
+
+  // Try to match each asset
+  for (var j = 0; j < usedAssets.length; j++) {
+    var asset = usedAssets[j];
+    var matchedProduct = null;
+    var matchMethod = "";
+
+    // Skip bone/skeleton assets - they're part of base Genesis
+    if (isBoneOrSkeleton(asset)) {
+      continue;
+    }
+
+    // Strategy 1: SKU extraction from technical name (try this first for clothing items)
+    matchedProduct = findSkuMatch(asset, productSkuMap);
+    if (matchedProduct) {
+      matchMethod = "SKU Match";
+    }
+
+    // Strategy 2: Direct technical name matching
+    if (!matchedProduct) {
+      matchedProduct = findDirectMatch(asset, productNameMap);
+      if (matchedProduct) {
+        matchMethod = "Direct Match";
+      }
+    }
+
+    // Strategy 3: Keyword-based fuzzy matching
+    if (!matchedProduct) {
+      matchedProduct = findKeywordMatch(asset, productKeywordMap, sceneGenesisVersion);
+      if (matchedProduct) {
+        matchMethod = "Keyword Match";
+      }
+    }
+
+    // Strategy 4: Known third-party product matching
+    if (!matchedProduct) {
+      matchedProduct = findThirdPartyMatch(asset, installedProducts);
+      if (matchedProduct) {
+        matchMethod = "Third-Party Match";
+      }
+    }
+
+    // Strategy 5: Genesis base assets
+    if (!matchedProduct) {
+      matchedProduct = findGenesisBaseMatch(asset, installedProducts);
+      if (matchedProduct) {
+        matchMethod = "Genesis Base Match";
+      }
+    }
+
+    if (matchedProduct) {
+      matches.push({
+        asset: asset,
+        product: matchedProduct,
+        method: matchMethod,
+      });
+    } else {
+      unmatched.push(asset);
+    }
+  }
+
+  return {
+    matches: matches,
+    unmatched: unmatched,
+  };
+}
+
+function findSkuMatch(asset, productSkuMap) {
+  var techName = asset.technicalName;
+
+  // Look for SKU patterns in technical names
+  // Examples: "SaltBikini_Bra_2050", "Bags_11509", "GoldenPalace_2254"
+  var skuMatch = techName.match(/_(\d{4,5})$/);
+  if (skuMatch) {
+    var sku = skuMatch[1];
+    // Try different SKU formats
+    var skuVariants = [sku + "-1", "0" + sku + "-1", sku + "-01"];
+
+    for (var i = 0; i < skuVariants.length; i++) {
+      if (productSkuMap[skuVariants[i]]) {
+        return productSkuMap[skuVariants[i]];
+      }
+    }
+  }
+
+  return null;
+}
+
+function findDirectMatch(asset, productNameMap) {
+  var assetName = asset.name.toLowerCase();
+  var techName = asset.technicalName.toLowerCase();
+
+  // Try partial matches for common patterns
+  for (var productName in productNameMap) {
+    if (
+      productName.indexOf("cartoonized") !== -1 &&
+      (assetName.indexOf("cartoon") !== -1 ||
+        techName.indexOf("cartoon") !== -1)
+    ) {
+      return productNameMap[productName];
+    }
+  }
+
+  return null;
+}
+
+function findKeywordMatch(asset, productKeywordMap, sceneGenesisVersion) {
+  var assetKeywords = extractKeywords(asset.name + " " + asset.technicalName);
+  var candidateProducts = {};
+  var maxScore = 0;
+  var bestMatch = null;
+
+  // Score products based on keyword overlap
+  for (var i = 0; i < assetKeywords.length; i++) {
+    var keyword = assetKeywords[i];
+    if (productKeywordMap[keyword]) {
+      var products = productKeywordMap[keyword];
+      for (var j = 0; j < products.length; j++) {
+        var product = products[j];
+
+        // Skip products explicitly for wrong Genesis version
+        if (sceneGenesisVersion && productIsWrongGenesisVersion(product.name, sceneGenesisVersion)) {
+          continue;
+        }
+
+        var productId = product.name;
+        if (!candidateProducts[productId]) {
+          candidateProducts[productId] = { product: product, score: 0 };
+        }
+        candidateProducts[productId].score++;
+
+        // Bonus score if product matches scene Genesis version
+        if (sceneGenesisVersion && productMatchesGenesisVersion(product.name, sceneGenesisVersion)) {
+          candidateProducts[productId].score += 2;
+        }
+      }
+    }
+  }
+
+  // Find best scoring product
+  for (var productId in candidateProducts) {
+    if (candidateProducts[productId].score > maxScore) {
+      maxScore = candidateProducts[productId].score;
+      bestMatch = candidateProducts[productId].product;
+    }
+  }
+
+  // Only return if we have a reasonable confidence (at least 2 keyword matches)
+  return maxScore >= 2 ? bestMatch : null;
+}
+
+function findThirdPartyMatch(asset, installedProducts) {
+  var name = asset.name.toLowerCase();
+  var techName = asset.technicalName.toLowerCase();
+
+  // Known third-party product patterns to search for in asset names
+  var knownProducts = [
+    { pattern: "dicktator", searchTerms: ["dicktator"] },
+    { pattern: "goldenpalace", searchTerms: ["golden palace", "goldenpalace"] },
+    { pattern: "golden_palace", searchTerms: ["golden palace", "goldenpalace"] },
+    { pattern: "lva", searchTerms: ["lva "] },
+    { pattern: "pinup", searchTerms: ["pinup", "pin-up", "pin up"] },
+  ];
+
+  for (var k = 0; k < knownProducts.length; k++) {
+    var known = knownProducts[k];
+    if (name.indexOf(known.pattern) !== -1 || techName.indexOf(known.pattern) !== -1) {
+      // Found a known product pattern, search for matching installed product
+      for (var i = 0; i < installedProducts.length; i++) {
+        var product = installedProducts[i];
+        var productName = product.name.toLowerCase();
+        for (var s = 0; s < known.searchTerms.length; s++) {
+          if (productName.indexOf(known.searchTerms[s]) !== -1) {
+            return product;
+          }
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function findGenesisBaseMatch(asset, installedProducts) {
+  var name = asset.name.toLowerCase();
+  var techName = asset.technicalName.toLowerCase();
+
+  // Check if it's a Genesis base asset
+  if (name.indexOf("genesis") !== -1 || techName.indexOf("genesis") !== -1) {
+    // Try to determine Genesis generation
+    var generation = "";
+    if (
+      name.indexOf("genesis 8.1") !== -1 ||
+      techName.indexOf("genesis8_1") !== -1
+    ) {
+      generation = "genesis 8";
+    } else if (
+      name.indexOf("genesis 8") !== -1 ||
+      techName.indexOf("genesis8") !== -1
+    ) {
+      generation = "genesis 8";
+    } else if (
+      name.indexOf("genesis 9") !== -1 ||
+      techName.indexOf("genesis9") !== -1
+    ) {
+      generation = "genesis 9";
+    } else if (
+      name.indexOf("genesis 3") !== -1 ||
+      techName.indexOf("genesis3") !== -1
+    ) {
+      generation = "genesis 3";
+    } else if (
+      name.indexOf("genesis 2") !== -1 ||
+      techName.indexOf("genesis2") !== -1
+    ) {
+      generation = "genesis 2";
+    } else if (name.indexOf("genesis") !== -1) {
+      generation = "genesis";
+    }
+
+    if (generation) {
+      // Look for matching starter essentials
+      for (var i = 0; i < installedProducts.length; i++) {
+        var product = installedProducts[i];
+        var productName = product.name.toLowerCase();
+        if (
+          productName.indexOf(generation) !== -1 &&
+          productName.indexOf("starter essentials") !== -1
+        ) {
+          return product;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractKeywords(text) {
+  var keywords = [];
+  var cleaned = text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ") // Remove special chars
+    .replace(/\s+/g, " ") // Normalize whitespace
+    .trim();
+
+  var words = cleaned.split(" ");
+
+  // Common/generic terms to skip - these cause false matches across Genesis versions
+  var stopWords = [
+    "for", "and", "the", "genesis", "female", "male",
+    "body", "morphs", "morph", "proportion", "proportions",
+    "height", "length", "smaller", "larger", "size",
+    "base", "head", "torso", "legs", "arms",
+    "shape", "shapes", "hd", "bs"
+  ];
+
+  for (var i = 0; i < words.length; i++) {
+    var word = words[i];
+    // Skip very short words and stop words
+    var isStopWord = false;
+    for (var s = 0; s < stopWords.length; s++) {
+      if (word === stopWords[s]) {
+        isStopWord = true;
+        break;
+      }
+    }
+    if (word.length > 2 && !isStopWord) {
+      keywords.push(word);
+    }
+  }
+
+  return keywords;
+}
+
+function isBoneOrSkeleton(asset) {
+  var name = asset.name.toLowerCase();
+  var techName = asset.technicalName.toLowerCase();
+
+  // Common bone/skeleton indicators
+  var boneKeywords = [
+    "thigh",
+    "shin",
+    "foot",
+    "toe",
+    "hand",
+    "finger",
+    "thumb",
+    "shoulder",
+    "forearm",
+    "collar",
+    "neck",
+    "head",
+    "jaw",
+    "abdomen",
+    "chest",
+    "pelvis",
+    "hip",
+    "spine",
+    "pectoral",
+    "eye",
+    "ear",
+    "nostril",
+    "eyelid",
+    "brow",
+    "lip",
+    "carpal",
+    "index",
+    "ring",
+    "pinky",
+    "mid",
+    "metatarsal",
+    "bigToe",
+    // Additional body parts
+    "chin",
+    "tongue",
+    "root",
+    "crease",
+    // Dicktator/genital bones
+    "shaft",
+    "foreskin",
+    "glans",
+    "urethra",
+    "scrotum",
+    "testicle",
+    "rectum",
+    "anus",
+    // Golden Palace/genital bones
+    "clitoris",
+    "clitzilla",
+    "vagina",
+    "tentacle",
+    "mons",
+    "labium",
+    "labia",
+    // Rendering/display nodes
+    "shell",
+  ];
+
+  // Check if it's a standard bone name
+  for (var i = 0; i < boneKeywords.length; i++) {
+    if (
+      name.indexOf(boneKeywords[i]) !== -1 ||
+      techName.indexOf(boneKeywords[i]) !== -1
+    ) {
+      return true;
+    }
+  }
+
+  // Check for bone naming patterns
+  if (
+    techName.match(/^[lr][A-Z]/) || // lThigh, rShin, etc.
+    techName.match(/^(upper|lower|mid)/i) || // upperTeeth, lowerJaw
+    name.match(/(left|right)\s/i)
+  ) {
+    // "Left Thigh", "Right Hand"
+    return true;
+  }
+
+  return false;
+}
+
+var usedAssets = getUsedAssets();
+var installedProducts = getInstalledProducts();
+
+function createListing() {
+  print("=== DAZ Studio Licensing Report Generator ===");
+
+  if (!usedAssets || usedAssets.length === 0) {
+    print("No used assets found in the current scene.");
+    return;
+  }
+
+  if (!installedProducts || installedProducts.length === 0) {
+    print("No installed products found.");
+    return;
+  }
+
+  print("Found " + usedAssets.length + " used assets");
+  print("Found " + installedProducts.length + " installed products");
+  print("Starting smart matching process...");
+
+  // Use the new smart matching logic
+  var matchResults = findProductMatches(usedAssets, installedProducts);
+
+  print("Matched " + matchResults.matches.length + " assets to products");
+  print("Unmatched assets: " + matchResults.unmatched.length);
+
+  // Name the report after the current scene (DthUtils.getSceneNameNoExt),
+  // falling back to a generic name for an unsaved scene.
+  var sceneName = getSceneNameNoExt() || "scene";
+
+  var output = [];
+  output.push("=== DAZ STUDIO LICENSING SUMMARY ===");
+  output.push("Scene: " + sceneName);
+  output.push("Generated: " + new Date().toLocaleString());
+  output.push("");
+  output.push("PRODUCTS REQUIRING LICENSING REVIEW:");
+  output.push("");
+
+  // Process matched assets
+  var productCounts = {};
+  for (var i = 0; i < matchResults.matches.length; i++) {
+    var match = matchResults.matches[i];
+    var productKey = match.product.name;
+
+    if (!productCounts[productKey]) {
+      productCounts[productKey] = {
+        product: match.product,
+        assets: [],
+        methods: [],
+      };
+    }
+
+    productCounts[productKey].assets.push(match.asset);
+    if (productCounts[productKey].methods.indexOf(match.method) === -1) {
+      productCounts[productKey].methods.push(match.method);
+    }
+  }
+
+  // Write matched products
+  for (var productKey in productCounts) {
+    var productInfo = productCounts[productKey];
+    var product = productInfo.product;
+
+    output.push("PRODUCT: " + product.name);
+    output.push("  SKU: " + product.sku);
+    output.push("  Artist: " + product.artist);
+    output.push("  Version: " + product.version);
+    output.push("  Matching Method(s): " + productInfo.methods.join(", "));
+    output.push("  Used Assets:");
+
+    for (var j = 0; j < productInfo.assets.length; j++) {
+      var asset = productInfo.assets[j];
+      output.push("    - " + asset.name + " (" + asset.technicalName + ")");
+    }
+    output.push("");
+  }
+
+  // Write unmatched assets that might need attention
+  if (matchResults.unmatched.length > 0) {
+    output.push("=== UNMATCHED ASSETS (May need manual review) ===");
+    output.push("");
+
+    for (var k = 0; k < matchResults.unmatched.length; k++) {
+      var unmatched = matchResults.unmatched[k];
+      // Only show interesting unmatched assets (not basic bones/morphs)
+      if (
+        unmatched.type === "Node" ||
+        (unmatched.type === "Morph" &&
+          unmatched.name.toLowerCase().indexOf("shape") !== -1) ||
+        unmatched.name.toLowerCase().indexOf("morph") !== -1
+      ) {
+        output.push(
+          "- " +
+            unmatched.name +
+            " (" +
+            unmatched.technicalName +
+            ") - Type: " +
+            unmatched.type
+        );
+      }
+    }
+  }
+
+  // Write to file, named after the scene
+  var filePath = dir_self.filePath("licensing_report_" + sceneName + ".txt");
+  var file = new DzFile(filePath);
+
+  if (file.open(DzFile.WriteOnly | DzFile.Text)) {
+    file.write(output.join("\n"));
+    file.close();
+    print("SUCCESS: Licensing report generated at: " + filePath);
+    print(
+      "Found licensing requirements for " +
+        Object.keys(productCounts).length +
+        " products"
+    );
+    MessageBox.information(
+      "Licensing report generated at: " + filePath,
+      "Success",
+      ""
+    );
+  } else {
+    print("ERROR: Failed to write licensing report to: " + filePath);
+  }
+}
+
+// Run the listing creation
+createListing();

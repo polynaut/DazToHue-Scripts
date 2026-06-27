@@ -1,0 +1,147 @@
+// DAZ Studio version 4.22.0.16 filetype DAZ Script
+
+// DAZ Install Manager Product Lister
+// Reads DIM manifest (.dsx) files to list all installed products.
+//
+// Part of DazToHue-Scripts. Pulls shared helpers from ../DthUtils.dsa
+// (verbose / DTH_VERBOSE) so progress output honours the same logging gate
+// as the rest of the toolkit.
+
+var dir_self = new DzDir (new DzFileInfo (getScriptFileName ()).path ());
+var dir_root = new DzDir (dir_self.path ());
+dir_root.cdUp ();   // products/ -> repo root, where DthUtils.dsa lives
+if (typeof verbose !== "function")
+	include (dir_root.filePath ("DthUtils.dsa"));
+
+// CONFIG: DIM manifest directory. This is platform-specific — set it for your
+// install. Examples:
+//   Windows: "E:/DAZ 3D/Install Manager/ManifestFiles"
+//   macOS:   "/Users/<you>/Library/Application Support/DAZ 3D/InstallManager/ManifestFiles"
+var dimManifestPath =
+  "E:/DAZ 3D/Install Manager/ManifestFiles";
+
+// extractXMLTag must be declared BEFORE parseManifestFile uses it.
+function extractXMLTag(xmlContent, tagName) {
+  try {
+    // Try both self-closing and regular tags
+    var patterns = [
+      new RegExp("<" + tagName + '\\s+VALUE="([^"]*)"/?>', "i"),
+      new RegExp("<" + tagName + "[^>]*>([^<]+)</" + tagName + ">", "i"),
+      new RegExp("<" + tagName + ">([^<]+)</" + tagName + ">", "i"),
+    ];
+
+    for (var i = 0; i < patterns.length; i++) {
+      var match = String(xmlContent).match(patterns[i]);
+      if (match && match[1]) {
+        return String(match[1]).trim();
+      }
+    }
+  } catch (e) {
+    // Silent fail for XML parsing errors
+  }
+
+  return null;
+}
+
+function parseManifestFile(manifestPath) {
+  try {
+    var file = new DzFile(manifestPath);
+    if (!file.open(DzFile.ReadOnly)) {
+      return null;
+    }
+
+    // Read the whole file at once (same idiom as DthUtils.readArtDirectionSibling)
+    var content = file.read();
+    file.close();
+
+    // Extract product information using XML-like parsing
+    var productName = extractXMLTag(content, "ProductName");
+    var sku =
+      extractXMLTag(content, "ProductStoreIDX") ||
+      extractXMLTag(content, "ProductID");
+    var artist = extractXMLTag(content, "ArtistName");
+    var version = extractXMLTag(content, "ProductVersion");
+    var installDate = extractXMLTag(content, "InstallDate");
+    var productType = extractXMLTag(content, "ProductType");
+    var description = extractXMLTag(content, "ProductDescription");
+
+    // Only return if we found at least a product name
+    if (productName) {
+      return {
+        name: String(productName).trim(),
+        sku: String(sku || "Unknown").trim(),
+        artist: String(artist || "Unknown").trim(),
+        version: String(version || "Unknown").trim(),
+        installDate: String(installDate || "Unknown").trim(),
+        productType: String(productType || "Unknown").trim(),
+        description: String(description || "").trim(),
+        manifestFile: manifestPath,
+      };
+    }
+  } catch (e) {
+    print("Error parsing manifest: " + manifestPath + " - " + e.message);
+  }
+
+  return null;
+}
+
+function getInstalledProducts() {
+  print("=== DAZ Install Manager Product Lister ===");
+
+  var products = [];
+
+  // Check if DIM manifest directory exists
+  var dimDir = new DzDir(dimManifestPath);
+  if (!dimDir.exists()) {
+    print("ERROR: DIM manifest directory not found at: " + dimManifestPath);
+    MessageBox.information(
+      "DIM manifest directory not found!\nExpected location: " +
+        dimManifestPath +
+        "\n\nSet dimManifestPath at the top of getInstalledProducts.dsa.",
+      "Directory Not Found",
+      "&OK"
+    );
+    return [];
+  }
+
+  print("Reading manifest files from: " + dimManifestPath);
+
+  // Get all entries and filter for .dsx files manually
+  var allEntries = dimDir.entryList();
+  var files = [];
+  for (var e = 0; e < allEntries.length; e++) {
+    var entry = String(allEntries[e]);
+    if (entry.toLowerCase().indexOf(".dsx") !== -1) {
+      files.push(entry);
+    }
+  }
+  print("Found " + files.length + " .dsx manifest files");
+
+  var manifestCount = 0;
+
+  for (var i = 0; i < files.length; i++) {
+    var fileName = String(files[i]);
+    var manifestPath = dimManifestPath + "/" + fileName;
+    var product = parseManifestFile(manifestPath);
+
+    if (product) {
+      products.push(product);
+      manifestCount++;
+
+      // Progress every 100 files — gated behind DTH_VERBOSE
+      if (manifestCount % 100 === 0) {
+        verbose("Processed " + manifestCount + " manifests...");
+      }
+    }
+  }
+
+  print("Processed " + manifestCount + " manifest files");
+  print("Found " + products.length + " products");
+
+  // Sort products by name
+  products.sort(function (a, b) {
+    return a.name.localeCompare(b.name);
+  });
+
+  return products;
+}
